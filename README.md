@@ -241,16 +241,97 @@ The final prototype achieved the following:
 
 The system demonstrates precise tuning of guitar strings with minimal iterations, achieving accurate frequency detection and adjustment even in the presence of ambient noise. The filtering and amplification stages ensure a high-fidelity signal, allowing the motor control algorithm to adjust the string tension accurately.
 
-## Future Enhancements
+## CPS Upgrades (v2)
 
--   Integrate a user interface for customizing tuning settings.
-    
--   Add support for multiple tuning presets.
-    
--   Improve power efficiency and portability.
-    
--   Implement wireless connectivity for remote control and monitoring.
-    
+The project has been extended from a standalone embedded device into a proper
+**Cyber-Physical System (CPS)** through three targeted upgrades.
+
+### 1 – PID Closed-Loop Controller (replaces P-controller)
+
+The proportional-only controller has been replaced with a full **PID controller**
+in `Microcontroller Code/final_code.ino`.
+
+| Term | Role |
+|------|------|
+| **P** – `kp_increase` / `kp_decrease` | Per-string gain identified during system identification |
+| **I** – `KI = 0.02` | Eliminates steady-state frequency error |
+| **D** – `KD = 1.50` | Damps overshoot during large tension corrections |
+
+Anti-windup clamping (±50 Hz·s) prevents integral saturation.
+The closed-loop error signal:
+
+```
+e(t) = f_target − f_measured
+u(t) = kp·e(t) + KI·∫e(t)dt + KD·de(t)/dt
+```
+
+### 2 – WiFi Telemetry & MQTT Logging (IoT / CPS layer)
+
+The ESP32 now connects to a WiFi network and publishes structured JSON
+telemetry to an MQTT broker on every tuning iteration:
+
+```
+guitar_tuner/log    → {"string":1,"measured":80.08,"target":82.41,"error":2.33}
+guitar_tuner/status → {"event":"tuned","string":1}
+```
+
+Configure credentials in `final_code.ino`:
+
+```cpp
+const char* WIFI_SSID     = "YOUR_WIFI_SSID";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* MQTT_BROKER   = "YOUR_MQTT_BROKER_IP";
+const int   MQTT_PORT     = 1883;  // default MQTT port
+```
+
+The system operates fully offline if WiFi is unavailable.
+
+### 3 – Tone Matching Module (`Tone Matching/`)
+
+A new Python module implements **spectral tone matching** — the next research
+direction toward a _Guitar Tone Matching CPS_.  Given a *target* tone (e.g. a
+Neural DSP preset capture or a reference recording) and the *current* guitar
+tone, the module finds the optimal 3-band EQ + master-gain correction that
+minimises the log-spectral distance between them:
+
+```
+min_θ ‖ log S_target(f) − log S_output(f, θ) ‖²
+```
+
+where `θ = {bass_dB, mid_dB, treble_dB, master_dB}`.
+
+**Install dependencies:**
+
+```bash
+pip install -r "Tone Matching/requirements.txt"
+```
+
+**CLI usage:**
+
+```bash
+# Compare two audio files
+python "Tone Matching/tone_matching.py" --target reference.wav --current current.wav
+
+# Record from the microphone (2 seconds)
+python "Tone Matching/tone_matching.py" --target reference.wav
+```
+
+**Programmatic usage:**
+
+```python
+from tone_matching import ToneMatcher
+matcher = ToneMatcher()
+result = matcher.match_from_files("target.wav", "current.wav")
+# result = {"bass_gain_dB": -4.2, "mid_gain_dB": +1.8, "treble_gain_dB": +6.1,
+#           "master_gain_dB": -1.0, "spectral_distance_before": 0.34,
+#           "spectral_distance_after": 0.07, "optimiser_success": True}
+```
+
+Run the unit-test suite:
+
+```bash
+python -m pytest "Tone Matching/test_tone_matching.py" -v
+```
 
 ## Acknowledgements
 

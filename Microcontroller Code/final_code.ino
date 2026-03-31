@@ -1,9 +1,22 @@
 #include <arduinoFFT.h>
 #include <ESP_FlexyStepper.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
 
 #define SAMPLES 1024
 #define SAMPLING_FREQUENCY 700
 #define BUZZER_PIN 25
+
+// WiFi and MQTT configuration
+const char* WIFI_SSID     = "YOUR_WIFI_SSID";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* MQTT_BROKER   = "YOUR_MQTT_BROKER_IP";
+const int   MQTT_PORT     = 1883;
+const char* MQTT_TOPIC_LOG    = "guitar_tuner/log";
+const char* MQTT_TOPIC_STATUS = "guitar_tuner/status";
+
+WiFiClient   wifiClient;
+PubSubClient mqttClient(wifiClient);
 
 unsigned int samplingPeriod;
 unsigned long microSeconds;
@@ -29,42 +42,101 @@ const int buttonPins[6] = {12, 13, 14, 15, 16, 17};
 // Create the stepper motor object 
 ESP_FlexyStepper stepper;
 
-// kp values for raising and lowering the pitch for each string
-double kp_crestere[6] = {9.05, 10.56, 8.27, 6.56, 5.15, 6.12}; 
-double kp_scadere[6] = {10.56, 11.52, 9.49, 6.63, 5.40, 8.15}; 
+// P-controller gains for raising and lowering the pitch for each string
+double kp_increase[6] = {9.05, 10.56, 8.27, 6.56, 5.15, 6.12};
+double kp_decrease[6] = {10.56, 11.52, 9.49, 6.63, 5.40, 8.15};
+
+// PID integral and derivative terms (per string, reset on each new tuning session)
+double pid_integral[6]      = {0, 0, 0, 0, 0, 0};
+double pid_prev_error[6]    = {0, 0, 0, 0, 0, 0};
+unsigned long pid_last_time[6] = {0, 0, 0, 0, 0, 0};
+
+// PID Ki and Kd gains (tuned conservatively to supplement the existing Kp)
+const double KI = 0.02;
+const double KD = 1.50;
+
+// Maximum allowable integral windup (in Hz·s)
+const double INTEGRAL_WINDUP_LIMIT = 50.0;
+
+void setupWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("\nWiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi connection failed. Continuing offline.");
+  }
+}
+
+void mqttReconnect() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (mqttClient.connected()) return;
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  if (mqttClient.connect("GuitarTunerESP32")) {
+    Serial.println("MQTT connected.");
+    mqttClient.publish(MQTT_TOPIC_STATUS, "online");
+  }
+}
+
+void mqttPublish(const char* topic, const String& payload) {
+  if (mqttClient.connected()) {
+    mqttClient.publish(topic, payload.c_str());
+  }
+}
 
 void setup() {
   Serial.begin(115200);
   pinMode(BUZZER_PIN, OUTPUT);
   samplingPeriod = round(1000000 * (1.0 / SAMPLING_FREQUENCY));
-  Serial.println("Selecteaza o coarda (apasati butonul corespunzator):");
+  Serial.println("Select a string (press the corresponding button):");
 
   // Initialize stepper motor
   stepper.connectToPins(MOTOR_STEP_PIN, MOTOR_DIRECTION_PIN);
   pinMode(MOTOR_ENABLE_PIN, OUTPUT);
-  digitalWrite(MOTOR_ENABLE_PIN, LOW);  // Motor driver disabled by default (used only when moving the motor)
+  digitalWrite(MOTOR_ENABLE_PIN, LOW);  // Motor driver disabled by default
 
-  stepper.setSpeedInStepsPerSecond(400); // Set initial speed
-  //stepper.setAccelerationInStepsPerSecondPerSecond(5000); // Setare acceleration (if needed)
+  stepper.setSpeedInStepsPerSecond(400);
 
   // Initialize button pins
   for (int i = 0; i < 6; i++) {
     pinMode(buttonPins[i], INPUT_PULLUP);
   }
+
+  setupWiFi();
+  mqttReconnect();
 }
 
 void loop() {
+  mqttClient.loop();
+  mqttReconnect();
+
   // Check button press
   for (int i = 0; i < 6; i++) {
     if (digitalRead(buttonPins[i]) == LOW) {
       stringToTune = i;
-      Serial.print("S-a selectat coarda ");
+      // Reset PID state for the newly selected string
+      pid_integral[i]   = 0;
+      pid_prev_error[i] = 0;
+      pid_last_time[i]  = millis();
+
+      Serial.print("Selected string ");
       Serial.println(stringToTune + 1);
+
+      String msg = "{\"event\":\"string_selected\",\"string\":" + String(stringToTune + 1) + "}";
+      mqttPublish(MQTT_TOPIC_LOG, msg);
+
       delay(3000);  // Delay 3 seconds for tuner positioning
 
-      // Play C4 note to start sample collection (261.63 Hz)
-      tone(BUZZER_PIN, 262, 1000);  // Lasts 1 second
-      delay(1000);  // Wait for sound to finish and collect samples
+      // Play C4 note to signal start of sample collection (261.63 Hz)
+      tone(BUZZER_PIN, 262, 1000);
+      delay(1000);
     }
   }
 
@@ -75,50 +147,86 @@ void loop() {
 
 void tuneString() {
   while (true) {
+    mqttClient.loop();
+
     computeAverageSpectrum(3);
     double dominantFrequency = findPeakFrequency();
-    double targetFrequency = expectedFrequencies[stringToTune];
-    double Difference = targetFrequency - dominantFrequency;
+    double targetFrequency   = expectedFrequencies[stringToTune];
+    double error             = targetFrequency - dominantFrequency;
 
     Serial.print("Current frequency for string ");
     Serial.print(stringToTune + 1);
     Serial.print(": ");
     Serial.println(dominantFrequency);
 
-    if (abs(Difference) <= 1) {  // Check if string is within ±1Hz of target frequency
-      Serial.println("Coarda selectata este acordata.");
-      tone(BUZZER_PIN, 349, 500);  // Play F4 note (string tuned)
+    // Publish telemetry
+    String telemetry = "{\"string\":" + String(stringToTune + 1) +
+                       ",\"measured\":" + String(dominantFrequency, 2) +
+                       ",\"target\":"   + String(targetFrequency, 2) +
+                       ",\"error\":"    + String(error, 2) + "}";
+    mqttPublish(MQTT_TOPIC_LOG, telemetry);
+
+    if (abs(error) <= 1.0) {  // String is within ±1 Hz of target
+      Serial.println("String is in tune.");
+      tone(BUZZER_PIN, 349, 500);
       delay(500);
-      tone(BUZZER_PIN, 262, 500);  // Play C4 note (string tuned)
+      tone(BUZZER_PIN, 262, 500);
       delay(500);
 
-      stringToTune = -1;  // Resetare coarda pentru acordat
+      mqttPublish(MQTT_TOPIC_STATUS, ("{\"event\":\"tuned\",\"string\":" + String(stringToTune + 1) + "}").c_str());
+
+      // Reset PID state
+      pid_integral[stringToTune]   = 0;
+      pid_prev_error[stringToTune] = 0;
+      stringToTune = -1;
       Serial.println("Choose a string to tune (1-6):");
       break;
     }
 
-    int StepsRequired;
+    // ── PID controller ───────────────────────────────────────────────────
+    unsigned long now     = millis();
+    double dt             = (now - pid_last_time[stringToTune]) / 1000.0;
+    if (dt <= 0) dt = 0.1;  // Guard against zero dt on first iteration
+    pid_last_time[stringToTune] = now;
 
-    if (dominantFrequency < targetFrequency - 1) {
+    // Integral with anti-windup clamping
+    pid_integral[stringToTune] += error * dt;
+    pid_integral[stringToTune] = constrain(pid_integral[stringToTune],
+                                            -INTEGRAL_WINDUP_LIMIT,
+                                             INTEGRAL_WINDUP_LIMIT);
+
+    // Derivative (filtered: no derivative kick on setpoint change)
+    double derivative = (error - pid_prev_error[stringToTune]) / dt;
+    pid_prev_error[stringToTune] = error;
+
+    // Select direction-specific Kp
+    double kp = (error > 0) ? kp_increase[stringToTune] : kp_decrease[stringToTune];
+
+    // PID output (motor steps)
+    double pidOutput = kp * error
+                     + KI * pid_integral[stringToTune]
+                     + KD * derivative;
+
+    int stepsRequired = (int)round(pidOutput);
+    // ─────────────────────────────────────────────────────────────────────
+
+    if (error > 0) {
       Serial.println("Increasing string tension.");
-      StepsRequired = Difference * kp_increase[stringToTune]; // Larger step size for increasing tension
-      StepsRequired = -abs(StepsRequired); // Ensure steps are negative for raising tension
-    } else if (dominantFrequency > targetFrequency + 1) {
+      stepsRequired = -abs(stepsRequired);  // Negative steps raise tension
+    } else {
       Serial.println("Decreasing string tension.");
-      StepsRequired = Difference * kp_decrease[stringToTune]; // Smaller step size for decreasing tension
-      StepsRequired = abs(StepsRequired); // Ensure steps are positive for lowering tension
+      stepsRequired = abs(stepsRequired);   // Positive steps lower tension
     }
 
-     // Debugging statements to check motor control values
-    Serial.print("Pasi necesari: ");
-    Serial.println(StepsRequired);
+    Serial.print("Steps required: ");
+    Serial.println(stepsRequired);
 
-    // Activate motor driver, move to position, and disable driver
-    digitalWrite(MOTOR_ENABLE_PIN, HIGH); // ENABLE driver
-    stepper.setSpeedInStepsPerSecond(200); // Constant speed
-    stepper.setAccelerationInStepsPerSecondPerSecond(5000); // Constant acceleration
-    stepper.moveToPositionInSteps(stepper.getCurrentPositionInSteps() + StepsRequired);
-    digitalWrite(MOTOR_ENABLE_PIN, LOW); // DISABLE driver
+    // Activate motor driver, move, then disable driver
+    digitalWrite(MOTOR_ENABLE_PIN, HIGH);
+    stepper.setSpeedInStepsPerSecond(200);
+    stepper.setAccelerationInStepsPerSecondPerSecond(5000);
+    stepper.moveToPositionInSteps(stepper.getCurrentPositionInSteps() + stepsRequired);
+    digitalWrite(MOTOR_ENABLE_PIN, LOW);
   }
 }
 
